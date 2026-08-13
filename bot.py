@@ -141,7 +141,7 @@ async def run_kick_check(triggered_by: str = "scheduled"):
 
     volume_by_user_id = {}
     for row in raw_records:
-        uid = str(row.get("user_id", "")).strip()
+        uid = str(row.get("user_id", "")).strip().lower()
         if uid:
             try:
                 volume_by_user_id[uid] = float(row.get("volume", 0) or 0)
@@ -178,7 +178,7 @@ async def run_kick_check(triggered_by: str = "scheduled"):
             status_rows.append([discord_id_raw, username, "", "", "", "", "", "", "Error - invalid join date", now_str])
             continue
 
-        current_volume = volume_by_user_id.get(broker_id)
+        current_volume = volume_by_user_id.get(broker_id.lower())
         if current_volume is None:
             # No CSV data for this user_id yet - can't evaluate, not an error, just not due
             status_rows.append([discord_id_raw, username, str(join_date), "", "", "", "", "", "No trade data yet", now_str])
