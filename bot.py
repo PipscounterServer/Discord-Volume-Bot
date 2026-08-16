@@ -122,7 +122,7 @@ async def run_kick_check(triggered_by: str = "scheduled"):
         cycle_start_str = str(row.get("Cycle Start Date", "")).strip()
         cycle_vol_str = str(row.get("Cycle Start Volume", "")).strip()
         prev_status = str(row.get("Status", "")).strip()
-        if did and cycle_start_str and prev_status in ("OK", "Not due yet"):
+        if did and cycle_start_str and prev_status in ("OK", "Not due yet", "ANOMALY - volume decreased, check CSV data"):
             parsed = parse_date(cycle_start_str)
             if parsed:
                 try:
@@ -191,6 +191,21 @@ async def run_kick_check(triggered_by: str = "scheduled"):
             cycle_start_date, cycle_start_volume = previous_cycle_by_discord_id[discord_id_raw]
         else:
             cycle_start_date, cycle_start_volume = join_date, 0.0
+
+        # Anomaly check: cumulative volume should never go DOWN. If it did, the
+        # CSV pasted this run is likely stale, filtered, or otherwise wrong - skip
+        # evaluating this person entirely rather than risk a wrongful kick on bad data.
+        if current_volume < cycle_start_volume:
+            results["errors"].append(
+                f"{username or discord_id_raw}: volume dropped from {cycle_start_volume} to "
+                f"{current_volume} since last check - looks like bad/stale CSV data, skipped"
+            )
+            status_rows.append([
+                discord_id_raw, username, str(cycle_start_date), cycle_start_volume,
+                current_volume, current_volume - cycle_start_volume, "", "",
+                "ANOMALY - volume decreased, check CSV data", now_str
+            ])
+            continue
 
         elapsed = months_elapsed(cycle_start_date, today)
 
@@ -266,20 +281,25 @@ async def run_kick_check(triggered_by: str = "scheduled"):
             results["errors"].append(f"Kick failed for {member}: {e}")
 
     # Rewrite Status Overview fully each run (simple, avoids stale rows), including
-    # during dry runs so you can preview what would happen.
+    # during dry runs so you can preview what would happen. Written as ONE batched
+    # write instead of one API call per row, to avoid hitting Google's per-minute
+    # write quota on servers with many members.
     try:
-        status_ws.clear()
-        status_ws.append_row([
+        header = [
             "Discord ID", "Discord Username", "Cycle Start Date", "Cycle Start Volume",
             "Current Volume", "Volume This Cycle", "Months Elapsed", "Lots Required",
             "Status", "Last Checked"
-        ])
-        for r in status_rows:
-            status_ws.append_row(r)
+        ]
+        status_ws.clear()
+        status_ws.update([header] + status_rows, value_input_option="USER_ENTERED")
     except Exception as e:
         results["errors"].append(f"Failed to update Status Overview: {e}")
 
     await post_summary(results, triggered_by)
+
+    if results["errors"]:
+        for err in results["errors"]:
+            logger.error(f"Detail: {err}")
 
     if not results["kicked"] and not results["errors"]:
         logger.info("Check complete: no members needed kicking.")
