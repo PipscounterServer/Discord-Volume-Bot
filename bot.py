@@ -1,25 +1,3 @@
-"""
-Discord IB Volume Kick Bot (v2 - rolling per-member cycles)
-------------------------------------------------------------
-Each member's "month" runs from THEIR OWN join date, not a shared calendar
-month. Every time this bot runs, it checks each trading member individually:
-
-  - How many full months have passed since their cycle start?
-  - If 0: not due yet, skip (this naturally protects new members during
-    their first partial month).
-  - If 1+: they need (months_elapsed * MIN_LOTS) lots traded since their
-    cycle start. If they meet it, their cycle quietly rolls forward with a
-    fresh baseline. If not, they're kicked immediately - no grace period.
-
-This works even if you update the CSV data irregularly - the bot always
-calculates the correct number of months elapsed and scales the requirement
-accordingly, so nobody is unfairly checked against just "1 lot" after
-several months have actually passed.
-
-Requirements:
-    pip install discord.py gspread oauth2client python-dotenv python-dateutil
-"""
-
 import os
 import logging
 from datetime import datetime, date, timezone
@@ -46,6 +24,8 @@ SHEET_SETTINGS = "Settings"
 
 LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID")
 LOG_CHANNEL_ID = int(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
+
+NEW_MEMBER_ROLE_NAME = os.getenv("NEW_MEMBER_ROLE_NAME", "Freshman")
 
 # One-time safety switch for your first test only - not a per-run confirmation.
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
@@ -351,6 +331,26 @@ async def checkvolumes(ctx):
         f"Not due: {len(results['not_due'])}, Not found: {len(results['skipped_not_found'])}, "
         f"Errors: {len(results['errors'])}"
     )
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    role = discord.utils.get(member.guild.roles, name=NEW_MEMBER_ROLE_NAME)
+    if role is None:
+        logger.error(
+            f"Could not assign role: no role named '{NEW_MEMBER_ROLE_NAME}' found in this server."
+        )
+        return
+    try:
+        await member.add_roles(role, reason="Auto-assigned on join")
+        logger.info(f"Assigned '{NEW_MEMBER_ROLE_NAME}' role to new member {member}.")
+    except discord.Forbidden:
+        logger.error(
+            f"Missing permission to assign '{NEW_MEMBER_ROLE_NAME}' to {member} - "
+            f"make sure the bot's role is positioned ABOVE '{NEW_MEMBER_ROLE_NAME}' in Server Settings > Roles."
+        )
+    except Exception as e:
+        logger.error(f"Failed to assign role to {member}: {e}")
 
 
 @bot.event
