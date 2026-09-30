@@ -1,3 +1,25 @@
+"""
+Discord IB Volume Role-Demotion Bot (v2 - rolling per-member cycles)
+------------------------------------------------------------
+Each member's "month" runs from THEIR OWN join date, not a shared calendar
+month. Every time this bot runs, it checks each trading member individually:
+
+  - How many full months have passed since their cycle start?
+  - If 0: not due yet, skip (this naturally protects new members during
+    their first partial month).
+  - If 1+: they need MIN_LOTS lots traded since their cycle start. If they
+    meet it, their cycle quietly rolls forward with a fresh baseline. If
+    not, they are immediately moved from the ELITE_ROLE_NAME role to the
+    DEMOTE_TO_ROLE_NAME role (e.g. "Elite Student" -> "Freshman") - no
+    grace period, and no kick from the server at all.
+
+This works even if you update the CSV data irregularly - the bot always
+calculates the correct number of months elapsed for each member.
+
+Requirements:
+    pip install discord.py gspread oauth2client python-dotenv python-dateutil
+"""
+
 import os
 import logging
 from datetime import datetime, date, timezone
@@ -26,6 +48,8 @@ LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID")
 LOG_CHANNEL_ID = int(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
 
 NEW_MEMBER_ROLE_NAME = os.getenv("NEW_MEMBER_ROLE_NAME", "Freshman")
+ELITE_ROLE_NAME = os.getenv("ELITE_ROLE_NAME", "Elite Student")
+DEMOTE_TO_ROLE_NAME = os.getenv("DEMOTE_TO_ROLE_NAME", "Freshman")
 
 # One-time safety switch for your first test only - not a per-run confirmation.
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
@@ -214,7 +238,7 @@ async def run_kick_check(triggered_by: str = "scheduled"):
             ])
             continue
 
-        # Below required - kick
+        # Below required - demote role instead of kicking
         member = guild.get_member(int(discord_id_raw)) if discord_id_raw.isdigit() else None
         if member is None and discord_id_raw.isdigit():
             try:
@@ -233,32 +257,56 @@ async def run_kick_check(triggered_by: str = "scheduled"):
 
         if DRY_RUN:
             logger.info(
-                f"[DRY RUN] Would kick {member or discord_id_raw} "
+                f"[DRY RUN] Would demote {member or discord_id_raw} from '{ELITE_ROLE_NAME}' "
+                f"to '{DEMOTE_TO_ROLE_NAME}' "
                 f"(needed {required} lots over {elapsed} month(s), had {volume_this_cycle})"
             )
             status_rows.append([
                 discord_id_raw, username, str(cycle_start_date), cycle_start_volume,
                 current_volume, volume_this_cycle, elapsed, required,
-                "Would kick (dry run)", now_str
+                "Would demote (dry run)", now_str
             ])
             continue
 
         try:
-            await member.kick(reason=f"Below required volume: {volume_this_cycle} / {required} lots over {elapsed} month(s)")
+            elite_role = discord.utils.get(guild.roles, name=ELITE_ROLE_NAME)
+            demote_role = discord.utils.get(guild.roles, name=DEMOTE_TO_ROLE_NAME)
+            if demote_role is None:
+                results["errors"].append(
+                    f"Could not find role '{DEMOTE_TO_ROLE_NAME}' to demote {member} into"
+                )
+                status_rows.append([
+                    discord_id_raw, username, str(cycle_start_date), cycle_start_volume,
+                    current_volume, volume_this_cycle, elapsed, required,
+                    "Error - demote role not found", now_str
+                ])
+                continue
+
+            if elite_role is not None and elite_role in member.roles:
+                await member.remove_roles(
+                    elite_role,
+                    reason=f"Below required volume: {volume_this_cycle} / {required} lots over {elapsed} month(s)"
+                )
+            if demote_role not in member.roles:
+                await member.add_roles(
+                    demote_role,
+                    reason=f"Below required volume: {volume_this_cycle} / {required} lots over {elapsed} month(s)"
+                )
+
             results["kicked"].append(f"{member} (needed {required}, had {volume_this_cycle})")
             kicklog_ws.append_row([
                 now_str, discord_id_raw, username, elapsed, required, volume_this_cycle,
-                "Below required volume for elapsed period"
+                f"Below required volume for elapsed period - moved '{ELITE_ROLE_NAME}' -> '{DEMOTE_TO_ROLE_NAME}'"
             ])
             status_rows.append([
                 discord_id_raw, username, str(cycle_start_date), cycle_start_volume,
                 current_volume, volume_this_cycle, elapsed, required,
-                "Kicked", now_str
+                "Demoted", now_str
             ])
         except discord.Forbidden:
-            results["errors"].append(f"Missing permission to kick {member}")
+            results["errors"].append(f"Missing permission to change roles for {member}")
         except Exception as e:
-            results["errors"].append(f"Kick failed for {member}: {e}")
+            results["errors"].append(f"Role change failed for {member}: {e}")
 
     # Rewrite Status Overview fully each run (simple, avoids stale rows), including
     # during dry runs so you can preview what would happen. Written as ONE batched
@@ -282,10 +330,10 @@ async def run_kick_check(triggered_by: str = "scheduled"):
             logger.error(f"Detail: {err}")
 
     if not results["kicked"] and not results["errors"]:
-        logger.info("Check complete: no members needed kicking.")
+        logger.info("Check complete: no members needed demoting.")
     else:
         logger.info(
-            f"Check complete: kicked={len(results['kicked'])}, "
+            f"Check complete: demoted={len(results['kicked'])}, "
             f"ok={len(results['ok'])}, not_due={len(results['not_due'])}, "
             f"errors={len(results['errors'])}"
         )
@@ -302,7 +350,7 @@ async def post_summary(results, triggered_by):
 
     mode = "DRY RUN" if DRY_RUN else "LIVE"
     lines = [f"**Volume check complete** ({mode}, triggered by: {triggered_by})"]
-    lines.append(f"Kicked: {len(results.get('kicked', []))}")
+    lines.append(f"Demoted: {len(results.get('kicked', []))}")
     lines.append(f"OK: {len(results.get('ok', []))}")
     lines.append(f"Not due yet: {len(results.get('not_due', []))}")
     lines.append(f"Not found in server: {len(results.get('skipped_not_found', []))}")
@@ -311,15 +359,106 @@ async def post_summary(results, triggered_by):
         for err in results["errors"][:10]:
             lines.append(f"  - {err}")
     if results.get("kicked"):
-        lines.append("\n**Kicked users:**")
+        lines.append("\n**Demoted users:**")
         for k in results["kicked"][:20]:
             lines.append(f"  - {k}")
 
     await channel.send("\n".join(lines))
 
 
+@bot.command(name="swaprole")
+@commands.has_permissions(manage_roles=True)
+async def swaprole(ctx, *, role_names: str):
+    """Usage: !swaprole Old Role Name -> New Role Name"""
+    if "->" not in role_names:
+        await ctx.send("Usage: `!swaprole Old Role Name -> New Role Name`")
+        return
+
+    old_name, new_name = [part.strip() for part in role_names.split("->", 1)]
+    old_role = discord.utils.get(ctx.guild.roles, name=old_name)
+    new_role = discord.utils.get(ctx.guild.roles, name=new_name)
+
+    if old_role is None:
+        await ctx.send(f"Couldn't find a role named '{old_name}'.")
+        return
+    if new_role is None:
+        await ctx.send(f"Couldn't find a role named '{new_name}'.")
+        return
+
+    await ctx.send(f"Swapping '{old_name}' -> '{new_name}' for all members... this may take a moment.")
+    changed = 0
+    errors = 0
+    async for member in ctx.guild.fetch_members(limit=None):
+        if old_role in member.roles:
+            try:
+                await member.remove_roles(old_role, reason=f"Bulk swap to {new_name}")
+                await member.add_roles(new_role, reason=f"Bulk swap from {old_name}")
+                changed += 1
+            except Exception as e:
+                errors += 1
+                logger.error(f"Failed to swap role for {member}: {e}")
+
+    await ctx.send(f"Done. Swapped {changed} member(s) from '{old_name}' to '{new_name}'. Errors: {errors}")
+
+
+@bot.command(name="norole")
+@commands.has_permissions(manage_roles=True)
+async def norole(ctx):
+    """Lists members with no roles at all (besides the default @everyone). Read-only, changes nothing."""
+    await ctx.send("Checking for members with no roles... this may take a moment.")
+    no_role_members = []
+    async for member in ctx.guild.fetch_members(limit=None):
+        if not member.bot and len(member.roles) <= 1:  # only @everyone
+            no_role_members.append(f"{member} ({member.id})")
+
+    if not no_role_members:
+        await ctx.send("Everyone has at least one role.")
+        return
+
+    header = f"Found {len(no_role_members)} member(s) with no role:\n"
+    body = "\n".join(no_role_members)
+    full_message = header + body
+
+    # Discord messages cap at 2000 chars - split into chunks if needed
+    if len(full_message) <= 2000:
+        await ctx.send(full_message)
+    else:
+        await ctx.send(header)
+        chunk = ""
+        for line in no_role_members:
+            if len(chunk) + len(line) + 1 > 1900:
+                await ctx.send(chunk)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
+            await ctx.send(chunk)
+
+
+@bot.command(name="backfillroles")
+@commands.has_permissions(manage_roles=True)
+async def backfillroles(ctx, *, role_name: str = None):
+    """Usage: !backfillroles [Role Name] - defaults to NEW_MEMBER_ROLE_NAME if omitted"""
+    target_name = role_name.strip() if role_name else NEW_MEMBER_ROLE_NAME
+    role = discord.utils.get(ctx.guild.roles, name=target_name)
+    if role is None:
+        await ctx.send(f"Couldn't find a role named '{target_name}'.")
+        return
+
+    await ctx.send(f"Assigning '{target_name}' to all members missing it... this may take a moment.")
+    assigned = 0
+    async for member in ctx.guild.fetch_members(limit=None):
+        if role not in member.roles and not member.bot:
+            try:
+                await member.add_roles(role, reason="Backfill - existing member missing role")
+                assigned += 1
+            except Exception as e:
+                logger.error(f"Failed to assign role to {member}: {e}")
+
+    await ctx.send(f"Done. Assigned '{target_name}' to {assigned} member(s) who didn't have it.")
+
+
 @bot.command(name="checkvolumes")
-@commands.has_permissions(kick_members=True)
+@commands.has_permissions(manage_roles=True)
 async def checkvolumes(ctx):
     await ctx.send(f"Running volume check now... ({'DRY RUN' if DRY_RUN else 'LIVE'})")
     results = await run_kick_check(triggered_by=f"manual by {ctx.author}")
@@ -327,7 +466,7 @@ async def checkvolumes(ctx):
         await ctx.send(f"Error: {results['error']}")
         return
     await ctx.send(
-        f"Done. Kicked: {len(results['kicked'])}, OK: {len(results['ok'])}, "
+        f"Done. Demoted: {len(results['kicked'])}, OK: {len(results['ok'])}, "
         f"Not due: {len(results['not_due'])}, Not found: {len(results['skipped_not_found'])}, "
         f"Errors: {len(results['errors'])}"
     )
