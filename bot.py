@@ -94,6 +94,32 @@ def months_elapsed(start_date, today):
     return delta.years * 12 + delta.months
 
 
+def read_records_lenient(ws):
+    """Like get_all_records(), but tolerates blank/duplicate header cells (e.g. a
+    grey note typed into row 1 of Member Mapping) by ignoring those columns."""
+    values = ws.get_all_values()
+    if not values:
+        return []
+    header = [str(h).strip() for h in values[0]]
+    records = []
+    for raw_row in values[1:]:
+        record = {}
+        for idx, name in enumerate(header):
+            if name and name not in record:
+                record[name] = raw_row[idx] if idx < len(raw_row) else ""
+        records.append(record)
+    return records
+
+
+def parse_lots(value):
+    """Parse a lots number from a sheet cell; accepts '1.5' or '1,5'. Returns None
+    for blank, raises ValueError for something that isn't a number."""
+    text = str(value).strip().replace(",", ".")
+    if not text:
+        return None
+    return float(text)
+
+
 async def run_kick_check(triggered_by: str = "scheduled"):
     guild = bot.get_guild(GUILD_ID)
     if guild is None:
@@ -109,7 +135,7 @@ async def run_kick_check(triggered_by: str = "scheduled"):
         kicklog_ws = sh.worksheet(SHEET_KICK_LOG)
         settings_ws = sh.worksheet(SHEET_SETTINGS)
 
-        mapping_records = mapping_ws.get_all_records()
+        mapping_records = read_records_lenient(mapping_ws)
         raw_records = raw_ws.get_all_records()
         settings_records = settings_ws.get_all_records()
         previous_status_records = status_ws.get_all_records()
@@ -126,7 +152,10 @@ async def run_kick_check(triggered_by: str = "scheduled"):
         cycle_start_str = str(row.get("Cycle Start Date", "")).strip()
         cycle_vol_str = str(row.get("Cycle Start Volume", "")).strip()
         prev_status = str(row.get("Status", "")).strip()
-        if did and cycle_start_str and prev_status in ("OK", "Not due yet", "ANOMALY - volume decreased, check CSV data"):
+        if did and cycle_start_str and prev_status in (
+            "OK", "Not due yet", "ANOMALY - volume decreased, check CSV data",
+            "Demoted", "Already demoted", "Would demote (dry run)",
+        ):
             parsed = parse_date(cycle_start_str)
             if parsed:
                 try:
@@ -182,6 +211,31 @@ async def run_kick_check(triggered_by: str = "scheduled"):
             status_rows.append([discord_id_raw, username, "", "", "", "", "", "", "Error - invalid join date", now_str])
             continue
 
+        # Optional per-member minimum (Member Mapping > "Min Lots Override").
+        # Blank = use the global minimum from Settings.
+        member_min = min_lots
+        try:
+            override = parse_lots(row.get("Min Lots Override", ""))
+            if override is not None:
+                member_min = override
+        except ValueError:
+            results["errors"].append(
+                f"{username or discord_id_raw}: 'Min Lots Override' is not a number "
+                f"('{row.get('Min Lots Override')}') - skipped"
+            )
+            status_rows.append([discord_id_raw, username, "", "", "", "", "", "", "Error - invalid min lots override", now_str])
+            continue
+
+        # Optional "Restart Date": start a brand-new cycle for this member on that date.
+        restart_raw = str(row.get("Restart Date", "")).strip()
+        restart_date = parse_date(restart_raw) if restart_raw else None
+        if restart_raw and restart_date is None:
+            results["errors"].append(
+                f"{username or discord_id_raw}: 'Restart Date' '{restart_raw}' is not a valid date - skipped"
+            )
+            status_rows.append([discord_id_raw, username, "", "", "", "", "", "", "Error - invalid restart date", now_str])
+            continue
+
         current_volume = volume_by_user_id.get(broker_id.lower())
         if current_volume is None:
             # No CSV data for this user_id yet - can't evaluate, not an error, just not due
@@ -195,6 +249,14 @@ async def run_kick_check(triggered_by: str = "scheduled"):
             cycle_start_date, cycle_start_volume = previous_cycle_by_discord_id[discord_id_raw]
         else:
             cycle_start_date, cycle_start_volume = join_date, 0.0
+
+        # Restart: if a Restart Date is set and is later than the cycle we have on
+        # record, begin a fresh cycle on that date. The baseline is their lifetime
+        # volume right now, so lots traded BEFORE the restart don't count toward the
+        # new (possibly higher) requirement. Runs only once: after this the stored
+        # cycle start equals the restart date, so the condition is no longer true.
+        if restart_date is not None and cycle_start_date < restart_date:
+            cycle_start_date, cycle_start_volume = restart_date, current_volume
 
         # Anomaly check: cumulative volume should never go DOWN. If it did, the
         # CSV pasted this run is likely stale, filtered, or otherwise wrong - skip
@@ -212,17 +274,17 @@ async def run_kick_check(triggered_by: str = "scheduled"):
             continue
 
         elapsed = months_elapsed(cycle_start_date, today)
+        required = member_min
 
         if elapsed < 1:
             results["not_due"].append(username or discord_id_raw)
             status_rows.append([
                 discord_id_raw, username, str(cycle_start_date), cycle_start_volume,
-                current_volume, current_volume - cycle_start_volume, elapsed, 0,
+                current_volume, current_volume - cycle_start_volume, elapsed, required,
                 "Not due yet", now_str
             ])
             continue
 
-        required = min_lots
         volume_this_cycle = current_volume - cycle_start_volume
 
         if volume_this_cycle >= required:
@@ -255,6 +317,28 @@ async def run_kick_check(triggered_by: str = "scheduled"):
                 results["errors"].append(f"Row for {username}: fetch_member failed: {e}")
                 continue
 
+        # Only act on members who currently hold the Elite role. Anyone already
+        # moved to Freshman (or who never had Elite) is skipped - no repeat
+        # demotion, no duplicate Kick Log row, not counted again.
+        elite_role = discord.utils.get(guild.roles, name=ELITE_ROLE_NAME)
+        if elite_role is None:
+            results["errors"].append(
+                f"Could not find role '{ELITE_ROLE_NAME}' - check ELITE_ROLE_NAME in .env"
+            )
+            status_rows.append([
+                discord_id_raw, username, str(cycle_start_date), cycle_start_volume,
+                current_volume, volume_this_cycle, elapsed, required,
+                "Error - elite role not found", now_str
+            ])
+            continue
+        if elite_role not in member.roles:
+            status_rows.append([
+                discord_id_raw, username, str(cycle_start_date), cycle_start_volume,
+                current_volume, volume_this_cycle, elapsed, required,
+                "Already demoted", now_str
+            ])
+            continue
+
         if DRY_RUN:
             logger.info(
                 f"[DRY RUN] Would demote {member or discord_id_raw} from '{ELITE_ROLE_NAME}' "
@@ -269,7 +353,6 @@ async def run_kick_check(triggered_by: str = "scheduled"):
             continue
 
         try:
-            elite_role = discord.utils.get(guild.roles, name=ELITE_ROLE_NAME)
             demote_role = discord.utils.get(guild.roles, name=DEMOTE_TO_ROLE_NAME)
             if demote_role is None:
                 results["errors"].append(
@@ -282,11 +365,10 @@ async def run_kick_check(triggered_by: str = "scheduled"):
                 ])
                 continue
 
-            if elite_role is not None and elite_role in member.roles:
-                await member.remove_roles(
-                    elite_role,
-                    reason=f"Below required volume: {volume_this_cycle} / {required} lots over {elapsed} month(s)"
-                )
+            await member.remove_roles(
+                elite_role,
+                reason=f"Below required volume: {volume_this_cycle} / {required} lots over {elapsed} month(s)"
+            )
             if demote_role not in member.roles:
                 await member.add_roles(
                     demote_role,
