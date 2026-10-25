@@ -238,9 +238,11 @@ async def run_kick_check(triggered_by: str = "scheduled"):
 
         current_volume = volume_by_user_id.get(broker_id.lower())
         if current_volume is None:
-            # No CSV data for this user_id yet - can't evaluate, not an error, just not due
-            status_rows.append([discord_id_raw, username, str(join_date), "", "", "", "", "", "No trade data yet", now_str])
-            continue
+            # Not in the CSV at all = this person has never traded. Treat as 0 lots so
+            # the normal cycle rules apply (Not due yet -> demoted once a month passes).
+            # If they had volume on record before, the anomaly check below flags it
+            # instead (a vanished row usually means an incomplete CSV paste).
+            current_volume = 0.0
 
         # Cycle baseline: use the last confirmed baseline from the previous run if we
         # have one, otherwise this is their very first check - start from join date
